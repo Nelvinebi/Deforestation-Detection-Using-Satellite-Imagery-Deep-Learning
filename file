@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+Deforestation-Detection-Using-Satellite-Imagery-Deep-Learning (Synthetic)
+-------------------------------------------------------------------------
+
+Generates synthetic "before" and "after" reflectance patches, simulates
+deforestation as drops in NDVI (via RED↑, NIR↓ in affected areas), trains a
+CNN to classify patches (deforested vs. not), and evaluates performance.
+
+Requirements:
+  - Python 3.8+
+  - numpy, matplotlib, scikit-learn, torch, torchvision (for transforms only)
+
+Usage:
+  python deforestation_synthetic_cnn.py --n 1200 --size 32 --epochs 10 --batch 64 --out outputs
+"""
+
+import os
+import math
+import argparse
+import random
+from dataclasses import dataclass
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+
+
+# -----------------------------
+# Utilities & Reproducibility
+# -----------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+# -----------------------------
+# Synthetic Data Generation
+# -----------------------------
+@dataclass
+class SynthConfig:
+    patch_size: int = 32
+    n_samples: int = 1200    # > 100 by default
+    pos_ratio: float = 0.5   # ~50% deforested
+    noise_sigma: float = 0.04
+    seed: int = 42
+
+
+def _smooth_noise(img: np.ndarray, k: int = 5) -> np.ndarray:
+    """Very light smoothing using a box filter without scipy."""
+    assert k % 2 == 1, "kernel size should be odd"
+    pad = k // 2
+    padded = np.pad(img, ((pad, pad), (pad, pad)), mode="reflect")
+    out = np.zeros_like(img)
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            out[i, j] = padded[i:i + k, j:j + k].mean()
+    return out
+
+
+def _random_shape_mask(h: int, w: int) -> np.ndarray:
+    """Create a random rectangular or circular mask for deforestation."""
+    mask = np.zeros((h, w), dtype=np.float32)
+    if random.random() < 0.5:
+        # rectangle
+        rh, rw = random.randint(h//5, h//2), random.randint(w//5, w//2)
+        r0 = random.randint(0, h - rh)
+        c0 = random.randint(0, w - rw)
+        mask[r0:r0 + rh, c0:c0 + rw] = 1.0
+    else:
+        # circle
+        r = random.randint(min(h, w)//6, min(h, w)//3)
+        cy, cx = random.randint(r, h - r - 1), random.randint(r, w - r - 1)
+        yy, xx = np.ogrid[:h, :w]
+        mask[(yy - cy)**2 + (xx - cx)**2 <= r**2] = 1.0
+    # smooth edges a bit
+    mask = _smooth_noise(mask, k=3)
+    mask = np.clip(mask, 0.0, 1.0)
+    return mask
+
+
+def make_one_sample(ps: int, noise_sigma: float, deforested: bool) -> tuple[np.ndarray, int]:
+    """
+    Returns:
+      X: (C=5, H, W) channels = [RED_b, NIR_b, RED_a, NIR_a, NDVI_diff]
+      y: 0/1
+    """
+    # Base vegetation field (0..1) via smoothed uniform noise
+    base = np.random.rand(ps, ps).astype(np.float32)
+    base = _smooth_noise(base, k=7)
+    base = (base - base.min()) / (base.max() - base.min() + 1e-6)
+
+    # Simulate "before" reflectances influenced by vegetation
+    # vegetation -> high NIR, lower RED
+    RED_b = np.clip(0.25 + 0.25*(1.0 - base) + noise_sigma*np.random.randn(ps, ps), 0, 1)
+    NIR_b = np.clip(0.55 + 0.40*base + noise_sigma*np.random.randn(ps, ps), 0, 1)
+
+    # After: start from before
+    RED_a = RED_b.copy()
+    NIR_a = NIR_b.copy()
+
+    if deforested:
+        mask = _random_shape_mask(ps, ps)
+        # Deforestation effect: RED goes up, NIR goes down inside mask
+        RED_a = np.clip(RED_a + 0.25*mask + noise_sigma*np.random.randn(ps, ps), 0, 1)
+        NIR_a = np.clip(NIR_a - 0.35*mask + noise_sigma*np.random.randn(ps, ps), 0, 1)
+    else:
+        # Small natural variability
+        RED_a = np.clip(RED_a + noise_sigma*np.random.randn(ps, ps), 0, 1)
+        NIR_a = np.clip(NIR_a + noise_sigma*np.random.randn(ps, ps), 0, 1)
+
+    # NDVI before/after and diff
+    eps = 1e-6
+    NDVI_b = (NIR_b - RED_b) / (NIR_b + RED_b + eps)
+    NDVI_a = (NIR_a - RED_a) / (NIR_a + RED_a + eps)
+    NDVI_diff = NDVI_b - NDVI_a  # positive when vegetation decreases
+
+    # Stack channels (5, H, W)
+    X = np.stack([RED_b, NIR_b, RED_a, NIR_a, NDVI_diff], axis=0).astype(np.float32)
+    y = int(deforested)
+    return X, y
+
+
+def make_dataset(cfg: SynthConfig) -> tuple[np.ndarray, np.ndarray]:
+    n_pos = int(cfg.n_samples * cfg.pos_ratio)
+    n_neg = cfg.n_samples - n_pos
+    data = []
+    labels = []
+
+    for _ in range(n_pos):
+        X, y = make_one_sample(cfg.patch_size, cfg.noise_sigma, True)
+        data.append(X); labels.append(y)
+    for _ in range(n_neg):
+        X, y = make_one_sample(cfg.patch_size, cfg.noise_sigma, False)
+        data.append(X); labels.append(y)
+
+    data = np.stack(data, axis=0)
+    labels = np.array(labels, dtype=np.int64)
+    # shuffle
+    idx = np.random.permutation(len(labels))
+    return data[idx], labels[idx]
+
+
+class DeforestationDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X)
+        self.y = torch.from_numpy(y)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+
+# -----------------------------
+# Model
+# -----------------------------
+class SmallCNN(nn.Module):
+    def __init__(self, in_ch: int = 5, n_classes: int = 1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 16x16
+
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 8x8
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),  # 64x1x1
+        )
+        self.head = nn.Linear(64, n_classes)  # binary -> 1 logit
+
+    def forward(self, x):
+        x = self.net(x)
+        x = x.flatten(1)
+        return self.head(x).squeeze(1)
+
+
+# -----------------------------
+# Training / Evaluation
+# -----------------------------
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total, total_loss = 0, 0.0
+    for X, y in loader:
+        X, y = X.to(device), y.to(device).float()
+        optimizer.zero_grad()
+        logits = model(X)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        total += y.size(0)
+        total_loss += loss.item() * y.size(0)
+    return total_loss / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    all_y, all_p, all_s = [], [], []
+    for X, y in loader:
+        X = X.to(device)
+        logits = model(X)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        preds = (probs >= 0.5).astype(int)
+        all_p.append(preds)
+        all_s.append(probs)
+        all_y.append(y.numpy())
+    y_true = np.concatenate(all_y)
+    y_pred = np.concatenate(all_p)
+    scores = np.concatenate(all_s)
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
+    return acc, prec, rec, f1, cm, y_true, y_pred, scores
+
+
+def plot_examples(X, y_true, y_pred, scores, outdir, k=6):
+    ensure_dir(outdir)
+    k = min(k, len(y_true))
+    idx = np.random.choice(len(y_true), k, replace=False)
+    fig, axs = plt.subplots(k, 3, figsize=(9, 3*k))
+
+    for row, i in enumerate(idx):
+        # visualize NDVI before and after + diff
+        RED_b, NIR_b, RED_a, NIR_a, NDVI_diff = X[i]
+        eps = 1e-6
+        NDVI_b = (NIR_b - RED_b) / (NIR_b + RED_b + eps)
+        NDVI_a = (NIR_a - RED_a) / (NIR_a + RED_a + eps)
+
+        axs[row, 0].imshow(NDVI_b, vmin=-1, vmax=1)
+        axs[row, 0].set_title("NDVI Before")
+        axs[row, 1].imshow(NDVI_a, vmin=-1, vmax=1)
+        axs[row, 1].set_title("NDVI After")
+        axs[row, 2].imshow(NDVI_diff, vmin=-1, vmax=1)
+        axs[row, 2].set_title(f"NDVI Diff\nTrue:{y_true[i]} Pred:{y_pred[i]} p={scores[i]:.2f}")
+        for c in range(3):
+            axs[row, c].axis('off')
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(outdir, "examples.png"), dpi=180)
+    plt.close(fig)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n", type=int, default=1200, help="Number of samples (>100).")
+    parser.add_argument("--size", type=int, default=32, help="Patch size (pixels).")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs.")
+    parser.add_argument("--batch", type=int, default=64, help="Batch size.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--out", type=str, default="outputs", help="Output directory.")
+    args = parser.parse_args()
+
+    if args.n <= 100:
+        raise ValueError("Please set --n > 100 for sufficient data points.")
+
+    set_seed(args.seed)
+    ensure_dir(args.out)
+
+    # Create synthetic dataset
+    cfg = SynthConfig(patch_size=args.size, n_samples=args.n, seed=args.seed)
+    X, y = make_dataset(cfg)  # X: (N, 5, H, W), y: (N,)
+
+    # Split train/val
+    n_total = len(y)
+    n_train = int(0.8 * n_total)
+    n_val = n_total - n_train
+    dataset = DeforestationDataset(X, y)
+    train_ds, val_ds = random_split(dataset, [n_train, n_val],
+                                    generator=torch.Generator().manual_seed(args.seed))
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=0)
+
+    # Model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SmallCNN(in_ch=5).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Train
+    best_f1, best_state = -1, None
+    for ep in range(1, args.epochs + 1):
+        tr_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        acc, prec, rec, f1, cm, *_ = evaluate(model, val_loader, device)
+        print(f"Epoch {ep:02d} | loss {tr_loss:.4f} | val acc {acc:.3f} | P {prec:.3f} R {rec:.3f} F1 {f1:.3f}")
+        if f1 > best_f1:
+            best_f1, best_state = f1, {k: v.cpu() for k, v in model.state_dict().items()}
+
+    # Save best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model_path = os.path.join(args.out, "deforestation_cnn.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Saved model -> {model_path}")
+
+    # Final eval & artifacts
+    acc, prec, rec, f1, cm, y_true, y_pred, scores = evaluate(model, val_loader, device)
+    print("Confusion matrix:\n", cm)
+
+    # Save metrics
+    with open(os.path.join(args.out, "metrics.txt"), "w") as f:
+        f.write(f"ACC={acc:.4f}\nPREC={prec:.4f}\nREC={rec:.4f}\nF1={f1:.4f}\n")
+        f.write(f"CM=\n{cm}\n")
+
+    # Plot example predictions
+    plot_examples(X[val_loader.dataset.indices], y_true, y_pred, scores,
+                  outdir=args.out, k=8)
+
+    print("Done. Artifacts saved in:", args.out)
+
+
+if __name__ == "__main__":
+    main()

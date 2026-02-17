@@ -80,6 +80,8 @@ Author
 
 Agbozu Ebingiye Nelvin
 
+LinkedIn: *https://www.linkedin.com/in/agbozu-ebi/
+
 License
 
 This project is released under the MIT License. See LICENSE for details.
